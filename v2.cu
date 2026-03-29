@@ -22,65 +22,59 @@
    Edit ONLY this section.
    ============================================================ */
 
-// Double-buffered kernel with B transpose optimization
-#define TILE_M 128
-#define TILE_N 128
-#define TILE_K 8
-#define REG_M 8
-#define REG_N 8
-#define THREADS 256
+struct GPUTimer {
+    cudaEvent_t start, stop;
 
-// Transpose B on-the-fly for better memory access pattern
-__global__ void transpose_kernel(const float* __restrict__ B,
-                                float* __restrict__ B_T,
-                                int N)
-{
-    __shared__ float tile[32][33];  // +1 to avoid bank conflicts
-    
-    int x = blockIdx.x * 32 + threadIdx.x;
-    int y = blockIdx.y * 32 + threadIdx.y;
-    
-    if (x < N && y < N) {
-        tile[threadIdx.y][threadIdx.x] = B[y * N + x];
+    GPUTimer() {
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
     }
-    
-    __syncthreads();
-    
-    x = blockIdx.y * 32 + threadIdx.x;
-    y = blockIdx.x * 32 + threadIdx.y;
-    
-    if (x < N && y < N) {
-        B_T[y * N + x] = tile[threadIdx.x][threadIdx.y];
-    }
-}
 
-// Double-buffered matmul with prefetching
-__global__ void matmul_kernel_doublebuf(const float* __restrict__ A,
-                                        const float* __restrict__ B_T,
-                                        float* __restrict__ C,
-                                        int N)
+    ~GPUTimer() {
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    }
+
+    void tic() {
+        cudaEventRecord(start);
+    }
+
+    float toc() {
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, start, stop);
+        return ms;
+    }
+};
+
+// Larger tile kernel with different blocking strategy
+#define TILE_M 64
+#define TILE_N 64
+#define TILE_K 16
+#define REG_M 4
+#define REG_N 4
+
+__global__ void matmul_kernel_large_tile(const float* __restrict__ A,
+                                         const float* __restrict__ B,
+                                         float* __restrict__ C,
+                                         int N)
 {
-    // Double buffering: two sets of shared memory
-    __shared__ float smem_A[2][TILE_M * TILE_K];
-    __shared__ float smem_B[2][TILE_N * TILE_K];
+    __shared__ float smem_A[TILE_M][TILE_K];
+    __shared__ float smem_B[TILE_K][TILE_N];
     
     const int tid = threadIdx.x;
-    const int warp_id = tid / 32;
-    const int lane_id = tid % 32;
     
-    // Output tile position
-    const int row_base = blockIdx.y * TILE_M;
-    const int col_base = blockIdx.x * TILE_N;
+    // Block tile position
+    const int block_row = blockIdx.y * TILE_M;
+    const int block_col = blockIdx.x * TILE_N;
     
-    // Thread-local position within tile
+    // ✅ FIXED mapping (16×16 threads, each computes 4×4)
     const int thread_row = (tid / 16) * REG_M;
     const int thread_col = (tid % 16) * REG_N;
     
-    const int out_row = row_base + thread_row;
-    const int out_col = col_base + thread_col;
-    
-    // Register accumulation
     float acc[REG_M][REG_N];
+    
     #pragma unroll
     for (int i = 0; i < REG_M; ++i) {
         #pragma unroll
@@ -89,97 +83,52 @@ __global__ void matmul_kernel_doublebuf(const float* __restrict__ A,
         }
     }
     
-    float reg_A[REG_M];
-    float reg_B[REG_N];
-    
-    int write_buf = 0;
-    int read_buf = 0;
-    
-    // Prefetch first tile
-    int k_tile = 0;
-    if (k_tile < N) {
-        // Load A tile
-        #pragma unroll
-        for (int i = 0; i < (TILE_M * TILE_K) / THREADS; ++i) {
-            int idx = tid + i * THREADS;
-            int row = idx / TILE_K;
-            int col = idx % TILE_K;
-            if (row < TILE_M && (row_base + row) < N && (k_tile + col) < N) {
-                smem_A[write_buf][row * TILE_K + col] = A[(row_base + row) * N + k_tile + col];
-            }
-        }
+    for (int k_base = 0; k_base < N; k_base += TILE_K) {
         
-        // Load B_T tile (B_T is already transposed, so rows become columns)
-        #pragma unroll
-        for (int i = 0; i < (TILE_N * TILE_K) / THREADS; ++i) {
-            int idx = tid + i * THREADS;
-            int row = idx / TILE_K;
-            int col = idx % TILE_K;
-            if (row < TILE_N && (col_base + row) < N && (k_tile + col) < N) {
-                smem_B[write_buf][row * TILE_K + col] = B_T[(col_base + row) * N + k_tile + col];
-            }
-        }
-    }
-    
-    __syncthreads();
-    
-    // Main computation loop with double buffering
-    for (k_tile = 0; k_tile < N; k_tile += TILE_K) {
-        read_buf = write_buf;
-        write_buf = 1 - write_buf;
-        
-        // Prefetch next tile while computing current
-        if (k_tile + TILE_K < N) {
-            // Load A tile for next iteration
-            #pragma unroll
-            for (int i = 0; i < (TILE_M * TILE_K) / THREADS; ++i) {
-                int idx = tid + i * THREADS;
-                int row = idx / TILE_K;
-                int col = idx % TILE_K;
-                if (row < TILE_M && (row_base + row) < N && (k_tile + TILE_K + col) < N) {
-                    smem_A[write_buf][row * TILE_K + col] = A[(row_base + row) * N + k_tile + TILE_K + col];
-                }
-            }
+        // Load A
+        for (int i = tid; i < TILE_M * TILE_K; i += blockDim.x) {
+            int row = i / TILE_K;
+            int col = i % TILE_K;
+            int gm_row = block_row + row;
+            int gm_col = k_base + col;
             
-            // Load B_T tile for next iteration
-            #pragma unroll
-            for (int i = 0; i < (TILE_N * TILE_K) / THREADS; ++i) {
-                int idx = tid + i * THREADS;
-                int row = idx / TILE_K;
-                int col = idx % TILE_K;
-                if (row < TILE_N && (col_base + row) < N && (k_tile + TILE_K + col) < N) {
-                    smem_B[write_buf][row * TILE_K + col] = B_T[(col_base + row) * N + k_tile + TILE_K + col];
-                }
-            }
+            smem_A[row][col] = (gm_row < N && gm_col < N) ? 
+                               A[gm_row * N + gm_col] : 0.0f;
         }
         
-        // Compute using current tile
+        // Load B
+        for (int i = tid; i < TILE_K * TILE_N; i += blockDim.x) {
+            int row = i / TILE_N;
+            int col = i % TILE_N;
+            int gm_row = k_base + row;
+            int gm_col = block_col + col;
+            
+            smem_B[row][col] = (gm_row < N && gm_col < N) ? 
+                               B[gm_row * N + gm_col] : 0.0f;
+        }
+        
+        __syncthreads();
+        
         #pragma unroll
         for (int k = 0; k < TILE_K; ++k) {
-            // Load A strip
+            float a_reg[REG_M];
+            float b_reg[REG_N];
+            
             #pragma unroll
             for (int i = 0; i < REG_M; ++i) {
-                int a_row = thread_row + i;
-                if (a_row < TILE_M) {
-                    reg_A[i] = smem_A[read_buf][a_row * TILE_K + k];
-                }
+                a_reg[i] = smem_A[thread_row + i][k];
             }
             
-            // Load B strip
             #pragma unroll
             for (int j = 0; j < REG_N; ++j) {
-                int b_row = thread_col + j;
-                if (b_row < TILE_N) {
-                    reg_B[j] = smem_B[read_buf][b_row * TILE_K + k];
-                }
+                b_reg[j] = smem_B[k][thread_col + j];
             }
             
-            // Accumulate outer product
             #pragma unroll
             for (int i = 0; i < REG_M; ++i) {
                 #pragma unroll
                 for (int j = 0; j < REG_N; ++j) {
-                    acc[i][j] += reg_A[i] * reg_B[j];
+                    acc[i][j] += a_reg[i] * b_reg[j];
                 }
             }
         }
@@ -187,13 +136,13 @@ __global__ void matmul_kernel_doublebuf(const float* __restrict__ A,
         __syncthreads();
     }
     
-    // Write results
+    // Write output
     #pragma unroll
     for (int i = 0; i < REG_M; ++i) {
         #pragma unroll
         for (int j = 0; j < REG_N; ++j) {
-            int c_row = out_row + i;
-            int c_col = out_col + j;
+            int c_row = block_row + thread_row + i;
+            int c_col = block_col + thread_col + j;
             if (c_row < N && c_col < N) {
                 C[c_row * N + c_col] = acc[i][j];
             }
@@ -209,31 +158,29 @@ void matmul_gpu(int N,
     size_t bytes = (size_t)N * N * sizeof(float);
 
     // ── Allocate device buffers ───────────────────────────────
-    float *A_d, *B_d, *B_T_d, *C_d;
+    float *A_d, *B_d, *C_d;
     CUDA_CHECK(cudaMalloc(&A_d, bytes));
     CUDA_CHECK(cudaMalloc(&B_d, bytes));
-    CUDA_CHECK(cudaMalloc(&B_T_d, bytes));
     CUDA_CHECK(cudaMalloc(&C_d, bytes));
 
     // ── Transfer inputs to device ─────────────────────────────
     CUDA_CHECK(cudaMemcpy(A_d, A_h, bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(B_d, B_h, bytes, cudaMemcpyHostToDevice));
 
-    // ── Transpose B ───────────────────────────────────────────
-    {
-        dim3 block(32, 32);
-        dim3 grid((N + 31) / 32, (N + 31) / 32);
-        transpose_kernel<<<grid, block>>>(B_d, B_T_d, N);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
     // ── Launch matmul kernel ──────────────────────────────────
     {
-        dim3 block(THREADS);
+        dim3 block(256);
         dim3 grid((N + TILE_N - 1) / TILE_N, (N + TILE_M - 1) / TILE_M);
+        
+        GPUTimer timer;
+        timer.tic();
+        matmul_kernel_large_tile<<<grid, block>>>(A_d, B_d, C_d, N);
 
-        matmul_kernel_doublebuf<<<grid, block>>>(A_d, B_T_d, C_d, N);
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        float ms = timer.toc();
+        printf("V2 Kernel time: %.3f ms\n", ms);
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -244,7 +191,6 @@ void matmul_gpu(int N,
     // ── Free device memory ────────────────────────────────────
     CUDA_CHECK(cudaFree(A_d));
     CUDA_CHECK(cudaFree(B_d));
-    CUDA_CHECK(cudaFree(B_T_d));
     CUDA_CHECK(cudaFree(C_d));
 }
 

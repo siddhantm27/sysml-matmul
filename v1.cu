@@ -18,140 +18,143 @@
     } while (0)
 
 
+
+
 /* ============================================================
    Edit ONLY this section.
    ============================================================ */
+// ─── CUDA Timer Utility ──────────────────────────────────────
+struct GPUTimer {
+    cudaEvent_t start, stop;
+
+    GPUTimer() {
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+    }
+
+    ~GPUTimer() {
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    }
+
+    void tic() {
+        cudaEventRecord(start);
+    }
+
+    float toc() {
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, start, stop);
+        return ms;
+    }
+};
 
 // Hierarchical tiling with warp-level cooperation
 // BM, BN: thread block output tile
 // BK: shared memory tile along K dimension
-// WM, WN: warp output tile
 // TM, TN: thread output tile (register blocking)
 
 #define BM 128
 #define BN 128
-#define BK 16
-#define WM 64
-#define WN 64
+#define BK 8
 #define TM 8
 #define TN 8
-
-#define WARP_SIZE 32
-#define WARPS_PER_BLOCK ((BM * BN) / (WM * WN))
-
-// Vectorized load using float4
-__device__ __forceinline__ void load_smem_A(float* smem, const float* gmem, 
-                                            int tid, int row_base, int N) {
-    constexpr int ITEMS_PER_THREAD = (BM * BK) / 256;
-    
-    #pragma unroll
-    for (int i = 0; i < ITEMS_PER_THREAD; i += 4) {
-        int idx = tid * ITEMS_PER_THREAD + i;
-        int smem_row = idx / BK;
-        int smem_col = idx % BK;
-        
-        if (smem_row < BM && smem_col + 3 < BK) {
-            int gmem_row = row_base + smem_row;
-            int gmem_col = smem_col;
-            
-            if (gmem_row < N) {
-                float4 val = *reinterpret_cast<const float4*>(&gmem[gmem_row * N + gmem_col]);
-                *reinterpret_cast<float4*>(&smem[smem_row * BK + smem_col]) = val;
-            }
-        }
-    }
-}
-
-__device__ __forceinline__ void load_smem_B(float* smem, const float* gmem,
-                                            int tid, int col_base, int N) {
-    constexpr int ITEMS_PER_THREAD = (BK * BN) / 256;
-    
-    #pragma unroll
-    for (int i = 0; i < ITEMS_PER_THREAD; i += 4) {
-        int idx = tid * ITEMS_PER_THREAD + i;
-        int smem_row = idx / BN;
-        int smem_col = idx % BN;
-        
-        if (smem_row < BK && smem_col + 3 < BN) {
-            int gmem_row = smem_row;
-            int gmem_col = col_base + smem_col;
-            
-            if (gmem_col < N) {
-                float4 val = *reinterpret_cast<const float4*>(&gmem[gmem_row * N + gmem_col]);
-                *reinterpret_cast<float4*>(&smem[smem_row * BN + smem_col]) = val;
-            }
-        }
-    }
-}
 
 __global__ void matmul_kernel_hierarchical(const float* __restrict__ A,
                                           const float* __restrict__ B,
                                           float* __restrict__ C,
                                           int N)
 {
-    __shared__ float smem_A[BM * BK];
-    __shared__ float smem_B[BK * BN];
+    __shared__ float smem_A[BM][BK];
+    __shared__ float smem_B[BK][BN];
     
     const int tid = threadIdx.x;
-    const int warp_id = tid / WARP_SIZE;
-    const int lane_id = tid % WARP_SIZE;
     
     // Thread block tile location
     const int block_row = blockIdx.y * BM;
     const int block_col = blockIdx.x * BN;
     
-    // Warp tile location within block
-    const int warp_row = (warp_id / 2) * WM;
-    const int warp_col = (warp_id % 2) * WN;
-    
-    // Thread tile location within warp
-    const int thread_row = (lane_id / 8) * TM;
-    const int thread_col = (lane_id % 8) * TN;
+    // Thread's local tile position within the block
+    const int thread_row = (tid / 16) * TM;
+    const int thread_col = (tid % 16) * TN;
     
     // Global output position for this thread
-    const int out_row = block_row + warp_row + thread_row;
-    const int out_col = block_col + warp_col + thread_col;
+    const int out_row = block_row + thread_row;
+    const int out_col = block_col + thread_col;
     
     // Register tiles for accumulation
-    float reg_C[TM][TN] = {0.0f};
-    float reg_A[TM];
-    float reg_B[TN];
+    float reg_C[TM][TN];
+    
+    // Initialize accumulator
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            reg_C[i][j] = 0.0f;
+        }
+    }
     
     // Main loop over K dimension
     for (int k_base = 0; k_base < N; k_base += BK) {
-        // Load tiles into shared memory using vectorized loads
-        load_smem_A(smem_A, A + block_row * N + k_base, tid, block_row, N);
-        load_smem_B(smem_B, B + k_base * N + block_col, tid, block_col, N);
+        // Cooperatively load A tile into shared memory
+        #pragma unroll
+        for (int i = tid; i < BM * BK; i += blockDim.x) {
+            int row = i / BK;
+            int col = i % BK;
+            int gm_row = block_row + row;
+            int gm_col = k_base + col;
+            
+            if (gm_row < N && gm_col < N) {
+                smem_A[row][col] = A[gm_row * N + gm_col];
+            } else {
+                smem_A[row][col] = 0.0f;
+            }
+        }
+        
+        // Cooperatively load B tile into shared memory
+        #pragma unroll
+        for (int i = tid; i < BK * BN; i += blockDim.x) {
+            int row = i / BN;
+            int col = i % BN;
+            int gm_row = k_base + row;
+            int gm_col = block_col + col;
+            
+            if (gm_row < N && gm_col < N) {
+                smem_B[row][col] = B[gm_row * N + gm_col];
+            } else {
+                smem_B[row][col] = 0.0f;
+            }
+        }
         
         __syncthreads();
         
         // Compute on the tile with register blocking
         #pragma unroll
         for (int k = 0; k < BK; ++k) {
+            float reg_A[TM];
+            float reg_B[TN];
+            
             // Load A strip into registers
             #pragma unroll
-            for (int m = 0; m < TM; ++m) {
-                int a_row = warp_row + thread_row + m;
-                if (a_row < BM) {
-                    reg_A[m] = smem_A[a_row * BK + k];
-                }
+            for (int i = 0; i < TM; ++i) {
+                int a_row = thread_row + i;
+                reg_A[i] = smem_A[a_row][k];
             }
             
             // Load B strip into registers
             #pragma unroll
-            for (int n = 0; n < TN; ++n) {
-                int b_col = warp_col + thread_col + n;
-                if (b_col < BN) {
-                    reg_B[n] = smem_B[k * BN + b_col];
-                }
+            for (int j = 0; j < TN; ++j) {
+                int b_col = thread_col + j;
+                reg_B[j] = smem_B[k][b_col];
             }
             
             // Outer product accumulation
             #pragma unroll
-            for (int m = 0; m < TM; ++m) {
+            for (int i = 0; i < TM; ++i) {
                 #pragma unroll
-                for (int n = 0; n < TN; ++n) {
-                    reg_C[m][n] += reg_A[m] * reg_B[n];
+                for (int j = 0; j < TN; ++j) {
+                    reg_C[i][j] += reg_A[i] * reg_B[j];
                 }
             }
         }
@@ -161,13 +164,13 @@ __global__ void matmul_kernel_hierarchical(const float* __restrict__ A,
     
     // Write results back to global memory
     #pragma unroll
-    for (int m = 0; m < TM; ++m) {
+    for (int i = 0; i < TM; ++i) {
         #pragma unroll
-        for (int n = 0; n < TN; ++n) {
-            int c_row = out_row + m;
-            int c_col = out_col + n;
+        for (int j = 0; j < TN; ++j) {
+            int c_row = out_row + i;
+            int c_col = out_col + j;
             if (c_row < N && c_col < N) {
-                C[c_row * N + c_col] = reg_C[m][n];
+                C[c_row * N + c_col] = reg_C[i][j];
             }
         }
     }
@@ -194,8 +197,16 @@ void matmul_gpu(int N,
         dim3 block(256);  // 256 threads per block (8 warps)
         dim3 grid((N + BN - 1) / BN, (N + BM - 1) / BM);
 
+        GPUTimer timer;
+        timer.tic();
+
         matmul_kernel_hierarchical<<<grid, block>>>(A_d, B_d, C_d, N);
+
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        float ms = timer.toc();
+        printf("V1 Kernel time: %.3f ms\n", ms);
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
